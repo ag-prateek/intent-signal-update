@@ -1,71 +1,23 @@
-# Architecture Outline
+# Architecture
 
-## 1. Ingestion
+```text
+Manual input / CSV / API
+          ↓
+validation and normalization
+          ↓
+company resolution + deduplication
+          ↓
+signal scoring and time decay
+          ↓
+account aggregation + reinforcement
+          ↓
+briefs, priority queue, outreach
+```
 
-Collect structured and unstructured events from approved public, licensed, and first-party sources.
+The FastAPI service serves a browser dashboard and an OpenAPI REST interface. SQLAlchemy models store accounts, signals, outreach drafts, and reusable feed-source metadata. SQLite is the zero-configuration default; a PostgreSQL URL can be supplied without changing application code.
 
-Potential signal families:
+Each signal type has a base commercial weight, half-life, likely implication, and stakeholder map. Scores combine recency, source reliability, evidence confidence, and direct-versus-inferred provenance. Account scores weight the strongest active signals, add cross-signal reinforcement, and adjust for ICP fit.
 
-- Hiring and workforce changes
-- Funding, acquisition, and expansion
-- Executive and leadership changes
-- Technology adoption or migration
-- Website, product, and pricing changes
-- Regulatory and compliance events
-- Content consumption and first-party engagement
-- Vendor research and category activity
+A SHA-256 fingerprint generated from company domain, type, event title, event date, and source URL prevents duplicate events from inflating scores. Expired events remain available for audit but no longer influence active intent.
 
-## 2. Signal normalization
-
-Convert events into a common schema:
-
-- account
-- signal type
-- event timestamp
-- discovery timestamp
-- source
-- supporting evidence
-- confidence
-- expiration window
-- affected function
-- likely business implication
-
-## 3. Validation
-
-- Resolve the company identity
-- Verify the event against the source
-- Remove duplicates
-- Distinguish direct evidence from inference
-- Reject stale or weak signals
-
-## 4. Scoring
-
-Suggested dimensions:
-
-- Recency
-- Source reliability
-- Signal specificity
-- ICP fit
-- Persona relevance
-- Commercial urgency
-- Cross-signal reinforcement
-
-## 5. Activation
-
-Produce an account brief containing:
-
-- The observed signal
-- Why it may indicate active demand
-- Relevant stakeholders
-- Evidence links or references
-- Recommended timing
-- Suggested outreach angle
-- Draft email or message
-
-## 6. Guardrails
-
-- Do not fabricate intent
-- Clearly label inferences
-- Avoid sensitive personal data
-- Respect source terms, privacy rules, and outreach regulations
-- Keep outreach relevant, factual, and easy to opt out of
+The deterministic outreach generator always works without external services. The optional OpenAI path uses structured output and falls back to the deterministic draft when unavailable.
