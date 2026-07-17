@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Annotated
 
@@ -28,7 +29,16 @@ from app.services import (
 
 settings = get_settings()
 database = Database(settings.database_url)
-app = FastAPI(title=settings.app_name, version="0.1.0")
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    """Initialize application resources without deprecated startup events."""
+    database.create_all()
+    yield
+
+
+app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
 app.state.database = database
 app.add_middleware(
     CORSMiddleware,
@@ -45,11 +55,6 @@ def session_dep():
 
 
 SessionDep = Annotated[Session, Depends(session_dep)]
-
-
-@app.on_event("startup")
-def startup() -> None:
-    database.create_all()
 
 
 @app.middleware("http")
@@ -132,10 +137,10 @@ def account_brief(account_id: int, session: SessionDep):
         if signals
         else 0
     )
-    timing = {
-        "hot": "Act now",
-        "warm": "Review this week",
-    }.get(account.intent_band, "Monitor")
+    timing = {"hot": "Act now", "warm": "Review this week"}.get(
+        account.intent_band,
+        "Monitor",
+    )
     return {
         "account": serialize_account(account),
         "top_signals": [serialize_signal(item) for item in signals],
