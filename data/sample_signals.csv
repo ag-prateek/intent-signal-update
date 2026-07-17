@@ -1,0 +1,3 @@
+account_name,account_domain,signal_type,title,summary,source_name,source_url,event_date,evidence_kind,confidence,source_reliability
+Acme,acme.com,executive_hire,Acme appointed a new CRO,The company announced the appointment in its newsroom,Company newsroom,https://acme.com/news/new-cro,2026-07-10,direct,0.95,0.95
+Acme,acme.com,job_posting,Acme opened 25 revenue operations roles,Roles span sales operations and enablement,Careers page,https://acme.com/careers,2026-07-12,direct,0.90,0.90

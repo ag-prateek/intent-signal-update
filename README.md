@@ -1,55 +1,91 @@
 # Intent Signal Update
 
-Find B2B prospects the moment they are in-market.
+A runnable B2B intent-signal MVP that detects observable business events, scores account intent, creates explainable account briefs, and drafts outreach grounded in verified evidence.
 
-Intent Signal Update is a skill-driven prospecting system that detects credible buying signals, surfaces the accounts showing them, and creates outreach grounded in something real.
+## Included
 
-## What it does
+- Account and watchlist data model
+- Manual signal capture through dashboard and API
+- CSV bulk ingestion
+- Stable duplicate detection
+- Signal-specific decay and expiration
+- Confidence, source reliability, and direct/inferred provenance
+- Cross-signal reinforcement and ICP-fit adjustment
+- Hot, warm, watch, and cold account bands
+- Account briefs with evidence, implications, personas, and timing
+- Email and LinkedIn outreach generation
+- Optional OpenAI Responses API drafting with deterministic fallback
+- API-key protection
+- SQLite by default, PostgreSQL-compatible through SQLAlchemy
+- Docker and GitHub Actions CI
 
-1. **Detects intent** from observable changes such as hiring, funding, leadership moves, technology adoption, expansion, compliance pressure, product launches, and active research.
-2. **Ranks accounts** based on signal strength, recency, relevance, and fit.
-3. **Explains the evidence** behind every surfaced account.
-4. **Writes outreach** that references the triggering event without sounding automated or invasive.
-5. **Tracks signal decay** so teams act while the buying window is still open.
+## Run locally
 
-## Core skills
-
-- Signal discovery
-- Account identification and enrichment
-- Signal validation and deduplication
-- Intent scoring
-- Persona and buying-committee mapping
-- Evidence-backed outreach generation
-- Monitoring and refresh workflows
-
-## Product principle
-
-No generic personalization. Every recommendation should answer:
-
-- What changed?
-- Why might it matter now?
-- Who is likely to care?
-- What evidence supports the inference?
-- What is the most natural reason to start a conversation?
-
-## Initial workflow
-
-```text
-Sources → Signal extraction → Validation → Account matching
-        → Intent scoring → Persona mapping → Outreach draft
+```bash
+cp .env.example .env
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+python -m pip install -e ".[dev]"
+uvicorn app.main:app --reload
 ```
 
-## Repository structure
+Open `http://localhost:8000`. API docs are at `http://localhost:8000/docs`.
 
-```text
-.
-├── README.md
-├── docs/
-│   └── architecture.md
-└── skills/
-    └── README.md
+## Docker
+
+```bash
+cp .env.example .env
+docker compose up --build
 ```
 
-## Status
+## Configuration
 
-Initial product and system definition. Implementation stack and production data sources are intentionally open for selection.
+```dotenv
+DATABASE_URL=sqlite:///./intent_signals.db
+API_KEY=
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-5-mini
+```
+
+The app works without OpenAI. When `OPENAI_API_KEY` is absent, outreach uses the evidence-backed deterministic template. If `API_KEY` is set, API routes require `x-api-key` except `/api/health`.
+
+## Core scoring
+
+Each signal type has a commercial weight and half-life. Signal scores combine recency decay, source reliability, confidence, and direct-versus-inferred evidence. Account scores combine the strongest active signals, add reinforcement when independent signal types align, and adjust for ICP fit.
+
+Buying intent is always presented as an inference, never as a confirmed fact.
+
+## API examples
+
+```bash
+curl -X POST http://localhost:8000/api/signals \
+  -H "Content-Type: application/json" \
+  -d '{
+    "account_name":"Acme",
+    "account_domain":"acme.com",
+    "signal_type":"executive_hire",
+    "title":"Acme appointed a new CRO",
+    "source_name":"Company newsroom",
+    "source_url":"https://acme.com/news/cro",
+    "event_date":"2026-07-10T12:00:00Z",
+    "confidence":0.95,
+    "source_reliability":0.95
+  }'
+```
+
+A CSV import endpoint is available at `POST /api/ingest/csv`. Required columns are `account_name`, `account_domain`, `signal_type`, `title`, and `event_date`.
+
+## Validation
+
+```bash
+ruff check .
+pytest
+```
+
+## Guardrails
+
+- Do not fabricate intent or business problems.
+- Keep direct evidence separate from inference.
+- Allow signals to decay and expire.
+- Do not let duplicate events inflate scores.
+- Use only sources and outreach practices permitted by applicable terms, privacy rules, and regulations.
