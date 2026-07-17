@@ -17,5 +17,30 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install -e ".[dev]"
+      - run: python -m compileall -q app tests
       - run: ruff check .
-      - run: pytest
+      - run: pytest --cov=app --cov-report=term-missing
+      - run: docker build --tag intent-signal-update:test .
+      - name: Live server smoke test
+        run: |
+          export DATABASE_URL=sqlite:///./smoke.db
+          python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 > /tmp/intent-signal.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid"' EXIT
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:8000/api/health > /tmp/health.json; then
+              break
+            fi
+            sleep 1
+          done
+          python -c 'import json; assert json.load(open("/tmp/health.json")) == {"status": "ok"}'
+          curl --fail --silent --request POST http://127.0.0.1:8000/api/ingest/demo > /tmp/demo.json
+          curl --fail --silent http://127.0.0.1:8000/api/dashboard > /tmp/dashboard.json
+          python - <<'PY'
+          import json
+          demo = json.load(open("/tmp/demo.json"))
+          dashboard = json.load(open("/tmp/dashboard.json"))
+          assert demo["created"] == 4
+          assert dashboard["total_accounts"] == 3
+          assert dashboard["active_signals"] == 4
+          PY
