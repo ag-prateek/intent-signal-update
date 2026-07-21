@@ -6,6 +6,7 @@ import json
 import os
 import re
 import socket
+from email.utils import parsedate_to_datetime
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -18,7 +19,18 @@ from xml.etree import ElementTree as ET
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, HttpUrl
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func, select
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+    select,
+)
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from app.db import Base
@@ -179,14 +191,51 @@ def strip_html(value: str) -> str:
 def parse_date(value) -> datetime | None:
     if not value:
         return None
-    try:
-        return (
-            datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-            .astimezone(UTC)
-            .replace(tzinfo=None)
-        )
-    except (ValueError, TypeError):
-        return None
+    text = str(value).strip()
+    parsers = (
+        lambda item: datetime.fromisoformat(item.replace("Z", "+00:00")),
+        parsedate_to_datetime,
+    )
+    for parser in parsers:
+        try:
+            parsed = parser(text)
+        except (ValueError, TypeError, IndexError, AttributeError):
+            continue
+        if parsed.tzinfo is None:
+            return parsed
+        return parsed.astimezone(UTC).replace(tzinfo=None)
+    return None
+
+
+def normalize_content(value: str) -> str:
+    return re.sub(r"\s+", " ", value.casefold()).strip()
+
+
+def document_fingerprint(account_id: int, document: Document) -> str:
+    content = normalize_content(f"{document.title} {document.text}")
+    return hashlib.sha256(
+        f"{account_id}|{document.url}|{document.title}|{content}".encode()
+    ).hexdigest()
+
+
+def references_account(account: Account, *parts: str) -> bool:
+    haystack = normalize_content(" ".join(part for part in parts if part))
+    if not haystack:
+        return False
+
+    account_name = normalize_content(account.name)
+    if account_name and re.search(rf"(?<![a-z0-9]){re.escape(account_name)}(?![a-z0-9])", haystack):
+        return True
+
+    domain = normalize_content(account.domain or "")
+    if domain and domain in haystack:
+        return True
+
+    label = domain.split(".", 1)[0]
+    if len(label) >= 4 and re.search(rf"(?<![a-z0-9]){re.escape(label)}(?![a-z0-9])", haystack):
+        return True
+
+    return False
 
 
 def ensure_public_url(url: str) -> str:
@@ -199,7 +248,14 @@ def ensure_public_url(url: str) -> str:
         raise ValueError("Hostname could not be resolved") from exc
     for address in addresses:
         ip = ip_address(address[4][0])
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        ):
             raise ValueError("Private or reserved network targets are blocked")
     return url
 
@@ -210,31 +266,42 @@ async def fetch(
     *,
     robots: bool = False,
 ) -> httpx.Response:
-    ensure_public_url(url)
+    current_url = ensure_public_url(url)
     user_agent = getattr(SETTINGS, "user_agent", "IntentSignalResearchBot/1.0")
     if robots:
-        parsed = urlparse(url)
-        robot_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
-        try:
-            response = await client.get(
-                robot_url,
-                headers={"user-agent": user_agent},
-            )
-            parser = RobotFileParser()
-            parser.parse(response.text.splitlines())
-            if not parser.can_fetch(user_agent, url):
-                raise PermissionError("robots.txt disallows this URL")
-        except PermissionError:
-            raise
-        except Exception:
-            pass
-    response = await client.get(
-        url,
-        headers={"user-agent": user_agent},
-        follow_redirects=True,
-    )
-    response.raise_for_status()
-    return response
+        parsed = urlparse(current_url)
+        robot_url = ensure_public_url(f"{parsed.scheme}://{parsed.netloc}/robots.txt")
+        response = await client.get(
+            robot_url,
+            headers={"user-agent": user_agent},
+            follow_redirects=False,
+        )
+        if response.status_code == 404:
+            robot_lines = []
+        else:
+            response.raise_for_status()
+            robot_lines = response.text.splitlines()
+        parser = RobotFileParser()
+        parser.parse(robot_lines)
+        if not parser.can_fetch(user_agent, current_url):
+            raise PermissionError("robots.txt disallows this URL")
+
+    redirect_limit = int(getattr(SETTINGS, "max_redirects", 5))
+    for _ in range(redirect_limit + 1):
+        response = await client.get(
+            current_url,
+            headers={"user-agent": user_agent},
+            follow_redirects=False,
+        )
+        if response.status_code not in {301, 302, 303, 307, 308}:
+            response.raise_for_status()
+            return response
+        location = response.headers.get("location")
+        if not location:
+            response.raise_for_status()
+            return response
+        current_url = ensure_public_url(urljoin(current_url, location))
+    raise httpx.TooManyRedirects("Redirect limit exceeded")
 
 
 async def collect(
@@ -247,11 +314,13 @@ async def collect(
 
     if kind == "company_site":
         documents = []
+        errors = []
         for path in source.config.get("paths", ["/news", "/press", "/blog", "/careers"]):
             url = urljoin(source.url or f"https://{account.domain}", path)
             try:
                 response = await fetch(client, url, robots=True)
-            except Exception:
+            except Exception as exc:
+                errors.append(f"{url}: {exc}")
                 continue
             title = re.search(r"(?is)<title[^>]*>(.*?)</title>", response.text)
             documents.append(
@@ -261,6 +330,8 @@ async def collect(
                     strip_html(response.text)[:30000],
                 )
             )
+        if not documents and errors:
+            raise RuntimeError("; ".join(errors)[:500])
         return documents
 
     if kind == "rss":
@@ -276,6 +347,30 @@ async def collect(
                     strip_html((item.findtext("description") or "") + " " + title),
                     parse_date(item.findtext("pubDate")),
                 )
+            )
+        atom_entries = root.findall(".//{http://www.w3.org/2005/Atom}entry")
+        remaining = limit - len(documents)
+        for entry in atom_entries[: max(remaining, 0)]:
+            title = entry.findtext("{http://www.w3.org/2005/Atom}title") or "Untitled"
+            link = source.url or ""
+            for candidate in entry.findall("{http://www.w3.org/2005/Atom}link"):
+                rel = candidate.attrib.get("rel", "alternate")
+                href = candidate.attrib.get("href")
+                if href and rel == "alternate":
+                    link = href
+                    break
+                if href:
+                    link = href
+            summary = (
+                entry.findtext("{http://www.w3.org/2005/Atom}summary")
+                or entry.findtext("{http://www.w3.org/2005/Atom}content")
+                or ""
+            )
+            published = entry.findtext("{http://www.w3.org/2005/Atom}published") or entry.findtext(
+                "{http://www.w3.org/2005/Atom}updated"
+            )
+            documents.append(
+                Document(title, link, strip_html(f"{summary} {title}"), parse_date(published))
             )
         return documents
 
@@ -317,9 +412,7 @@ async def collect(
             Document(
                 job.get("title", "Job"),
                 job.get("jobUrl", url),
-                strip_html(
-                    (job.get("descriptionPlain") or "") + " " + job.get("title", "")
-                ),
+                strip_html((job.get("descriptionPlain") or "") + " " + job.get("title", "")),
                 parse_date(job.get("publishedAt")),
                 job,
             )
@@ -341,7 +434,8 @@ async def collect(
                 parse_date(article.get("seendate")),
                 article,
             )
-            for article in articles
+            for article in articles[:limit]
+            if references_account(account, article.get("title", ""), article.get("url", ""))
         ]
 
     if kind == "tavily":
@@ -369,15 +463,16 @@ async def collect(
                 None,
                 result,
             )
-            for result in response.json().get("results", [])
+            for result in response.json().get("results", [])[:limit]
+            if references_account(
+                account, result.get("title", ""), result.get("url", ""), result.get("content", "")
+            )
         ]
 
     api_key = os.getenv("FIRECRAWL_API_KEY")
     if not api_key:
         raise ValueError("FIRECRAWL_API_KEY is not configured")
-    query = source.config.get("query") or (
-        f'"{account.name}" company news jobs funding expansion'
-    )
+    query = source.config.get("query") or (f'"{account.name}" company news jobs funding expansion')
     response = await client.post(
         "https://api.firecrawl.dev/v1/search",
         headers={"Authorization": f"Bearer {api_key}"},
@@ -392,7 +487,13 @@ async def collect(
             None,
             result,
         )
-        for result in response.json().get("data", [])
+        for result in response.json().get("data", [])[:limit]
+        if references_account(
+            account,
+            result.get("title", ""),
+            result.get("url", ""),
+            result.get("description") or result.get("markdown") or "",
+        )
     ]
 
 
@@ -435,8 +536,7 @@ def extract(
                     confidence=confidence,
                     source_reliability=(
                         0.85
-                        if source_type
-                        in {"company_site", "greenhouse", "lever", "ashby"}
+                        if source_type in {"company_site", "greenhouse", "lever", "ashby"}
                         else 0.75
                     ),
                     raw_payload=document.raw or {},
@@ -477,13 +577,17 @@ async def execute(
                 for document in documents:
                     if not document.url:
                         continue
-                    fingerprint = hashlib.sha256(
-                        f"{account.id}|{document.url}|{document.title}".encode()
-                    ).hexdigest()
+                    if source.source_type in {
+                        "gdelt",
+                        "tavily",
+                        "firecrawl",
+                    } and not references_account(
+                        account, document.title, document.url, document.text
+                    ):
+                        continue
+                    fingerprint = document_fingerprint(account.id, document)
                     existing = session.scalar(
-                        select(ResearchDocument).where(
-                            ResearchDocument.fingerprint == fingerprint
-                        )
+                        select(ResearchDocument).where(ResearchDocument.fingerprint == fingerprint)
                     )
                     if existing:
                         continue
@@ -524,6 +628,29 @@ async def execute(
 def add_source(payload: SourceCreate, session: Session = Depends(session_dep)):
     if not session.get(Account, payload.account_id):
         raise HTTPException(status_code=404, detail="Account not found")
+    configured_without_url = {
+        "greenhouse": "board_token",
+        "lever": "site",
+        "ashby": "board",
+    }
+    url_required = {"company_site", "rss"}
+    missing_url = payload.source_type in url_required and not payload.url
+    missing_url_or_config = (
+        payload.source_type in configured_without_url
+        and not payload.url
+        and not payload.config.get(configured_without_url[payload.source_type])
+    )
+    if payload.enabled and (missing_url or missing_url_or_config):
+        raise HTTPException(status_code=422, detail="URL or provider configuration is required")
+    duplicate = session.scalar(
+        select(ExternalSource).where(
+            ExternalSource.account_id == payload.account_id,
+            ExternalSource.source_type == payload.source_type,
+            ExternalSource.url == (str(payload.url) if payload.url else None),
+        )
+    )
+    if duplicate:
+        raise HTTPException(status_code=409, detail="Source already exists or is invalid")
     source = ExternalSource(
         account_id=payload.account_id,
         source_type=payload.source_type,
@@ -580,9 +707,7 @@ def list_documents(
             "source_type": document.source_type,
             "title": document.title,
             "url": document.url,
-            "published_at": (
-                document.published_at.isoformat() if document.published_at else None
-            ),
+            "published_at": (document.published_at.isoformat() if document.published_at else None),
         }
         for document in session.scalars(query)
     ]
